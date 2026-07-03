@@ -76,12 +76,11 @@ ECM_NODE_URL = ECM_BASE_URL + "/OTCS/cs.exe/app/nodes"
 OTDS_CRED_URL = ECM_BASE_URL + "/otdsws/v1/authentication/credentials"
 
 # (sheet_name, node_id, friendly_label)
-# !!! 重要：sop 与 wi 必须是不同的 ECM 节点 ID。v4 里两者都写成了
-# !!! 28329098（复制粘贴错误），请把 wi 改成 WI 目录真实的节点 ID。
+# 节点 ID 由维护人从 ECM Smart View URL 中读取（.../app/nodes/<id>）。
 TARGETS = [
-    ("sop", 28329098, "SOP"),
-    ("wi", 28329098, "WI"),   # <-- TODO: 替换为 WI 目录真实 node_id！
-    ("manuals", 31587312, "工具文件"),
+    ("sop", 31594212, "SOP"),        # https://ecm.hengrui.com/OTCS/cs.exe/app/nodes/31594212
+    ("wi", 31587503, "WI"),          # https://ecm.hengrui.com/OTCS/cs.exe/app/nodes/31587503
+    ("manuals", 31587312, "工具文件"),  # 沿用原值，如有变更请一并更新
 ]
 
 OUTPUT_FILENAME = "sharepoint_files.xlsx"
