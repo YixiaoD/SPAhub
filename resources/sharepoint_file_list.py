@@ -25,9 +25,13 @@ ECM 文档目录爬取脚本（v6 — OpenText Content Server REST API）
        复制其中 otcsticket 的值；
        （或 Application → Cookies → ecm.hengrui.com → 复制名为
         OTCSTicket 的 cookie 值。）
-    3. 运行：
-         Windows:  set ECM_TICKET=粘贴票据 && python sharepoint_file_list.py
-         或：      python sharepoint_file_list.py --ticket 粘贴票据
+    3. 运行（推荐用 --ticket 参数，最不易出错）：
+         python sharepoint_file_list.py --ticket 粘贴票据
+       或用环境变量（注意 cmd 与 PowerShell 语法不同）：
+         cmd:         set ECM_TICKET=粘贴票据 && python sharepoint_file_list.py
+         PowerShell:  $env:ECM_TICKET="粘贴票据"; python sharepoint_file_list.py
+       ⚠ PowerShell 里千万别用 `set ECM_TICKET=...`（那是 cmd 语法，
+         在 PS 里只会设成 PS 变量、不是环境变量，Python 读不到）。
        脚本会直接用这个票据，跳过所有登录。票据有有效期，过期再复制一次即可。
 
   【方式 B：OTDS 账号密码（若你们 OTDS 支持直接密码认证，脚本会自动尝试）】
