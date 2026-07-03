@@ -8,7 +8,7 @@ ECM 文档目录爬取脚本（v6 — OpenText Content Server REST API）
   对每个文件提取：文件名 / NodeId / 相对子目录，并构造 ECM 节点浏览 URL。
   浏览器单击 URL → ECM Smart View 打开文件预览。
 
-输出文件（脚本同目录）：sharepoint_files.xlsx，3 个 sheet：sop / wi / manuals
+输出文件（脚本同目录）：ecm_files.xlsx，3 个 sheet：sop / wi / manuals
   每个 sheet 3 列：A=网页展示(文件名) B=网页链接(ECM URL) C=相对路径
 
 ------------------------------------------------------------------------
@@ -26,22 +26,22 @@ ECM 文档目录爬取脚本（v6 — OpenText Content Server REST API）
        （或 Application → Cookies → ecm.hengrui.com → 复制名为
         OTCSTicket 的 cookie 值。）
     3. 运行（推荐用 --ticket 参数，最不易出错）：
-         python sharepoint_file_list.py --ticket 粘贴票据
+         python ecm_file_list.py --ticket 粘贴票据
        或用环境变量（注意 cmd 与 PowerShell 语法不同）：
-         cmd:         set ECM_TICKET=粘贴票据 && python sharepoint_file_list.py
-         PowerShell:  $env:ECM_TICKET="粘贴票据"; python sharepoint_file_list.py
+         cmd:         set ECM_TICKET=粘贴票据 && python ecm_file_list.py
+         PowerShell:  $env:ECM_TICKET="粘贴票据"; python ecm_file_list.py
        ⚠ PowerShell 里千万别用 `set ECM_TICKET=...`（那是 cmd 语法，
          在 PS 里只会设成 PS 变量、不是环境变量，Python 读不到）。
        脚本会直接用这个票据，跳过所有登录。票据有有效期，过期再复制一次即可。
 
   【方式 B：OTDS 账号密码（若你们 OTDS 支持直接密码认证，脚本会自动尝试）】
-    set ECM_USER=liup71 && set ECM_PASS=你的密码 && python sharepoint_file_list.py
+    set ECM_USER=liup71 && set ECM_PASS=你的密码 && python ecm_file_list.py
     （v6 已修正 OTDS 请求字段 userName，v5 之前写成了 user_name 会必失败。）
 
   【方式 C：ADFS/OTCS 表单（多为联合登录环境，通常不可用，仅兜底尝试）】
 
   先跑诊断确认认证与节点是否 OK：
-    python sharepoint_file_list.py --diagnose
+    python ecm_file_list.py --diagnose
 ------------------------------------------------------------------------
 
 依赖：pip install openpyxl requests
@@ -87,7 +87,7 @@ TARGETS = [
     ("manuals", 31587312, "工具文件"),  # 沿用原值，如有变更请一并更新
 ]
 
-OUTPUT_FILENAME = "sharepoint_files.xlsx"
+OUTPUT_FILENAME = "ecm_files.xlsx"
 DEBUG = True
 PAGE_SIZE = 200
 
@@ -312,7 +312,7 @@ def authenticate(session, username, password):
     raise RuntimeError(
         "自动登录全部失败。本 ECM 多为 ADFS 联合登录，"
         "请改用【方式 A：浏览器票据】——见脚本顶部说明，或运行 "
-        "python sharepoint_file_list.py --ticket <浏览器复制的OTCSTicket>"
+        "python ecm_file_list.py --ticket <浏览器复制的OTCSTicket>"
     )
 
 
@@ -527,7 +527,7 @@ def main():
 
     if total == 0:
         print("\n⚠ 一个文件都没爬到，未覆盖旧 xlsx（避免清空可用数据）。")
-        print("  请先 python sharepoint_file_list.py --diagnose 排查。")
+        print("  请先 python ecm_file_list.py --diagnose 排查。")
         sys.exit(2)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -542,7 +542,7 @@ def main():
         print(f"  {sheet_name:10s} ({label}): "
               f"{len(data_by_sheet.get(sheet_name, []))} 行")
     print(f"{'=' * 60}")
-    print("\n下一步：把 sharepoint_files.xlsx 与 weblink.xlsx 同放到 "
+    print("\n下一步：把 ecm_files.xlsx 与 weblink.xlsx 同放到 "
           "SPAhub/resources/ 下，下次启动 SPAhub 生效。")
 
 

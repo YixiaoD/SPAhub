@@ -3,15 +3,15 @@ name: ecm-crawl
 description: >-
   爬取内网 OpenText Content Server（ECM，恒瑞 ecm.hengrui.com）指定目录下所有文件，
   导出文件名 + 节点链接 + 相对路径到 xlsx，供 SPAhub 等做文档树。当用户提到「爬取 ECM /
-  OTCS / 内网文档目录 / 刷新 sharepoint_files.xlsx / 更新文档链接」，或从 SharePoint
+  OTCS / 内网文档目录 / 刷新 ecm_files.xlsx / 更新文档链接」，或从 SharePoint
   迁移到 ECM 时使用。核心难点是 ADFS 联合登录——直接用账号密码登录会失败，必须复用浏览器票据。
 ---
 
 # 内网 ECM（OpenText Content Server）目录爬取
 
 把 ECM 若干根目录节点下的所有文件（含子文件夹）导出为 xlsx，每个文件一行：
-文件名 / ECM 节点链接 / 相对子目录。脚本在 `resources/sharepoint_file_list.py`，
-输出 `resources/sharepoint_files.xlsx`（沿用旧名，SPAhub 直接读）。
+文件名 / ECM 节点链接 / 相对子目录。脚本在 `resources/ecm_file_list.py`，
+输出 `resources/ecm_files.xlsx`（SPAhub 的 shortcuts.py 直接读）。
 
 ## 最重要的一条：认证走「浏览器票据」，不要试图用密码登录
 
@@ -28,7 +28,7 @@ description: >-
    ecm.hengrui.com → 名为 `OTCSTicket` 的 cookie 值）。
 3. 运行（**推荐 `--ticket` 参数，最不易踩坑**）：
    ```
-   python resources/sharepoint_file_list.py --ticket <粘贴票据> --diagnose
+   python resources/ecm_file_list.py --ticket <粘贴票据> --diagnose
    ```
    确认无误后去掉 `--diagnose` 正式跑。
 
@@ -76,6 +76,6 @@ TARGETS = [
 
 ## 完成后
 
-`sharepoint_files.xlsx`（sop / wi / manuals 三个 sheet）与 `weblink.xlsx` 同放在
+`ecm_files.xlsx`（sop / wi / manuals 三个 sheet）与 `weblink.xlsx` 同放在
 `resources/` 下，下次启动 SPAhub 生效。这是离线刷新任务，ECM 增删文件后由维护人手动跑一次，
 **不要**集成进 SPAhub GUI 触发（避免频繁网络爬取压 ECM 服务器）。
