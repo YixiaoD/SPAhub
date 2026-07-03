@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-ECM 文档目录爬取脚本（v5 — OpenText Content Server REST API，带诊断）
-====================================================================
+ECM 文档目录爬取脚本（v6 — OpenText Content Server REST API）
+============================================================
 
 功能：
   遍历 SPAhub 关心的 ECM 目录节点下所有文件（含子文件夹），
@@ -12,29 +12,39 @@ ECM 文档目录爬取脚本（v5 — OpenText Content Server REST API，带诊�
   每个 sheet 3 列：A=网页展示(文件名) B=网页链接(ECM URL) C=相对路径
 
 ------------------------------------------------------------------------
-v5 相对 v4 的修复（针对“爬不到链接”问题）：
-  1. sop / wi 之前误用同一个 node_id（复制粘贴错误），现改为在 TARGETS
-     中独立配置，wi 的 node_id 必须由维护人填入正确值（见下方 !!! 标记）。
-  2. 文件夹判定改用 properties.container（布尔），不再只认 type==0，
-     避免非 Folder 型容器被当成文件、导致子目录漏爬。
-  3. 关键：所有 HTTP 失败现在会打印【状态码 + 响应体】，认证失败会打印
-     每种方式的服务器返回，方便一眼看出是 401(票据过期) / 403(无权限) /
-     404(节点ID错) 还是认证根本没通过。之前这些信息全被吞掉了。
-  4. 票据过期自动重认证一次再重试。
-  5. 新增诊断模式：python sharepoint_file_list.py --diagnose
-     只做认证 + 逐个根节点探测（打印节点名/类型/子项数），不写 xlsx，
-     用来快速验证节点 ID、权限、认证是否正常。
+关于认证（重要！先读这段）
+------------------------------------------------------------------------
+诊断发现：本 ECM 走的是 ADFS 联合登录(SSO)——直接拿账号密码去 OTCS/OTDS
+登录会被拒（密码校验被联合到了 AD FS，本地端点不认）。因此脚本支持三种方式，
+按可靠度从高到低：
 
-使用：
-    pip install openpyxl requests requests-ntlm
-    # 正式爬取并覆写 xlsx：
-    python sharepoint_file_list.py
-    # 只诊断连通性 / 节点 / 权限（强烈建议第一次先跑这个）：
+  【方式 A：直接用浏览器票据（最稳，强烈推荐）】
+    1. 用浏览器正常登录 ECM（打开任意 Smart View 页面）。
+    2. F12 打开开发者工具 → Network（网络）标签 → 刷新页面 →
+       随便点一个发往 /OTCS/cs.exe/api/... 的请求 → 看 Request Headers，
+       复制其中 otcsticket 的值；
+       （或 Application → Cookies → ecm.hengrui.com → 复制名为
+        OTCSTicket 的 cookie 值。）
+    3. 运行：
+         Windows:  set ECM_TICKET=粘贴票据 && python sharepoint_file_list.py
+         或：      python sharepoint_file_list.py --ticket 粘贴票据
+       脚本会直接用这个票据，跳过所有登录。票据有有效期，过期再复制一次即可。
+
+  【方式 B：OTDS 账号密码（若你们 OTDS 支持直接密码认证，脚本会自动尝试）】
+    set ECM_USER=liup71 && set ECM_PASS=你的密码 && python sharepoint_file_list.py
+    （v6 已修正 OTDS 请求字段 userName，v5 之前写成了 user_name 会必失败。）
+
+  【方式 C：ADFS/OTCS 表单（多为联合登录环境，通常不可用，仅兜底尝试）】
+
+  先跑诊断确认认证与节点是否 OK：
     python sharepoint_file_list.py --diagnose
-  可用环境变量预置账号：set ECM_USER=... & set ECM_PASS=...
+------------------------------------------------------------------------
+
+依赖：pip install openpyxl requests
 """
 import os
 import sys
+import re
 import getpass
 import urllib3
 
@@ -50,12 +60,6 @@ except ImportError:
     print("请先安装依赖: pip install requests")
     raise
 
-try:
-    from requests_ntlm import HttpNtlmAuth
-    HAS_NTLM = True
-except ImportError:
-    HAS_NTLM = False
-
 # 禁用 SSL 警告（内网自签证书）
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -65,9 +69,11 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ============================================================================
 
 ECM_BASE_URL = "https://ecm.hengrui.com"
+ECM_HOST = "ecm.hengrui.com"
 ECM_API_BASE = ECM_BASE_URL + "/OTCS/cs.exe/api/v2"
 ECM_AUTH_URL = ECM_BASE_URL + "/OTCS/cs.exe/api/v1/auth"
 ECM_NODE_URL = ECM_BASE_URL + "/OTCS/cs.exe/app/nodes"
+OTDS_CRED_URL = ECM_BASE_URL + "/otdsws/v1/authentication/credentials"
 
 # (sheet_name, node_id, friendly_label)
 # !!! 重要：sop 与 wi 必须是不同的 ECM 节点 ID。v4 里两者都写成了
@@ -79,11 +85,7 @@ TARGETS = [
 ]
 
 OUTPUT_FILENAME = "sharepoint_files.xlsx"
-
-# 打印更多调试信息
 DEBUG = True
-
-# 单页大小
 PAGE_SIZE = 200
 
 
@@ -93,7 +95,6 @@ def dbg(msg):
 
 
 def _short(text, n=800):
-    """截断响应体，避免刷屏"""
     text = text or ""
     return text if len(text) <= n else text[:n] + " ...(truncated)"
 
@@ -102,23 +103,20 @@ def _short(text, n=800):
 # 认证
 # ============================================================================
 
-def ecm_authenticate(session, username, password):
-    """
-    通过 ECM 认证，返回 OTCSTicket。
-    依次尝试：OTCS 表单直连 → NTLM → OTDS → ADFS。
-    每种方式失败都会打印服务器返回，方便定位。
-    """
-    # 方法1：OTCS 表单直接认证（api/v1/auth，最标准）——尝试多种用户名格式
-    username_formats = [username]
+def _username_formats(username):
+    formats = [username]
     if "\\" not in username and "@" not in username:
-        username_formats += [f"HENGRUI\\{username}", f"{username}@hengrui.com"]
+        formats += [f"HENGRUI\\{username}", f"{username}@hengrui.com"]
+    return formats
 
-    for uname in username_formats:
+
+def otcs_form_login(session, username, password):
+    """OTCS 表单认证 api/v1/auth，返回 ticket 或 None。"""
+    for uname in _username_formats(username):
         print(f"  [OTCS 表单认证] 用户名={uname} ...")
         try:
             resp = session.post(
-                ECM_AUTH_URL,
-                data={"username": uname, "password": password},
+                ECM_AUTH_URL, data={"username": uname, "password": password},
                 verify=False, timeout=30,
             )
             if resp.status_code == 200:
@@ -126,81 +124,116 @@ def ecm_authenticate(session, username, password):
                 if ticket:
                     print(f"  ✔ OTCS 表单认证成功 (用户名={uname})")
                     return ticket
-                print(f"  ✘ 返回 200 但无 ticket: {_short(resp.text)}")
+                print(f"  ✘ 200 但无 ticket: {_short(resp.text)}")
             else:
                 print(f"  ✘ HTTP {resp.status_code}: {_short(resp.text)}")
         except Exception as e:
             print(f"  ✘ 请求异常: {e}")
+    return None
 
-    # 方法2：NTLM（域账号，仅当服务器对该端点启用了集成 Windows 认证时有效）
-    if HAS_NTLM:
-        ntlm_user = username if "\\" in username else f"HENGRUI\\{username}"
-        print(f"  [NTLM 认证] 用户名={ntlm_user} ...")
+
+def otds_login(session, username, password):
+    """
+    OTDS 认证 → 换 OTCS ticket。
+    v6 关键修复：请求体字段用 userName（驼峰），v5 之前写成 user_name，
+    OTDS 收到空用户名必然返回 INVALID_CREDENTIALS。
+    返回 OTCS ticket 或特殊值 "COOKIE"（表示已用 cookie 建立会话）或 None。
+    """
+    for uname in _username_formats(username):
+        print(f"  [OTDS 认证] userName={uname} ...")
         try:
             resp = session.post(
-                ECM_AUTH_URL, auth=HttpNtlmAuth(ntlm_user, password),
+                OTDS_CRED_URL,
+                json={"userName": uname, "password": password},
+                headers={"Content-Type": "application/json"},
                 verify=False, timeout=30,
             )
-            if resp.status_code == 200:
-                ticket = (resp.json() or {}).get("ticket") or ""
-                if ticket:
-                    print(f"  ✔ NTLM 认证成功 ({ntlm_user})")
-                    return ticket
-                print(f"  ✘ 返回 200 但无 ticket: {_short(resp.text)}")
-            else:
-                print(f"  ✘ HTTP {resp.status_code}: {_short(resp.text)}")
         except Exception as e:
-            print(f"  ✘ 请求异常: {e}")
+            print(f"  ✘ OTDS 请求异常: {e}")
+            continue
 
-    # 方法3：OTDS 认证 → 换取 OTCS ticket
-    otds_url = ECM_BASE_URL + "/otdsws/v1/authentication/credentials"
-    print(f"  [OTDS 认证] {otds_url} ...")
-    try:
-        resp = session.post(
-            otds_url,
-            json={"user_name": username, "password": password},
-            headers={"Content-Type": "application/json"},
-            verify=False, timeout=30,
-        )
-        if resp.status_code == 200:
-            j = resp.json() or {}
-            token = j.get("ticket") or j.get("token") or ""
-            if token:
-                print("  OTDS 认证成功，尝试用 OTDSTicket 换取 OTCS ticket ...")
-                otcs_resp = session.post(
-                    ECM_AUTH_URL, data={"OTDSTicket": token},
-                    verify=False, timeout=30,
-                )
-                if otcs_resp.status_code == 200:
-                    ticket = (otcs_resp.json() or {}).get("ticket") or ""
-                    if ticket:
-                        print("  ✔ OTDS → OTCS ticket 成功")
-                        return ticket
-                    print(f"  ✘ 换票返回 200 但无 ticket: {_short(otcs_resp.text)}")
-                else:
-                    print(f"  ✘ 换票 HTTP {otcs_resp.status_code}: "
-                          f"{_short(otcs_resp.text)}")
-                # 有些环境 OTDS token 可直接作为票据使用
-                print("  （回退：直接使用 OTDS token 作为票据）")
-                return token
-            print(f"  ✘ OTDS 返回 200 但无 token: {_short(resp.text)}")
-        else:
+        if resp.status_code != 200:
             print(f"  ✘ OTDS HTTP {resp.status_code}: {_short(resp.text)}")
-    except Exception as e:
-        print(f"  ✘ OTDS 请求异常: {e}")
+            continue
 
-    # 方法4：ADFS WS-Trust（usernamemixed）→ SAML → 换 OTCS ticket
-    print("  [ADFS WS-Trust 认证] ...")
+        j = resp.json() or {}
+        otds_ticket = j.get("ticket") or j.get("token") or ""
+        if not otds_ticket:
+            print(f"  ✘ OTDS 200 但无 ticket: {_short(resp.text)}")
+            continue
+        print(f"  OTDS 认证成功 (userName={uname})，换取 OTCS 会话 ...")
+
+        # 换法1：把 OTDSTicket 作为表单参数交给 OTCS
+        try:
+            r = session.post(ECM_AUTH_URL, data={"OTDSTicket": otds_ticket},
+                             verify=False, timeout=30)
+            if r.status_code == 200:
+                t = (r.json() or {}).get("ticket") or ""
+                if t:
+                    print("  ✔ OTDS → OTCS ticket 成功（表单换票）")
+                    return t
+        except Exception as e:
+            print(f"  （表单换票异常，忽略）: {e}")
+
+        # 换法2：把 OTDSTicket 塞进 cookie，让 OTCS SSO 直接放行
+        session.cookies.set("OTDSTicket", otds_ticket, domain=ECM_HOST)
+        probe = session.get(f"{ECM_API_BASE}/nodes/{TARGETS[0][1]}",
+                            verify=False, timeout=30)
+        if probe.status_code == 200:
+            print("  ✔ OTDS cookie 会话可用（cookie 模式）")
+            return "COOKIE"
+        print(f"  ✘ OTDS cookie 探测失败 HTTP {probe.status_code}: "
+              f"{_short(probe.text, 300)}")
+    return None
+
+
+def _discover_saml_entityids(session):
+    """尝试从 OTDS / OTCS 元数据发现 SAML SP entityID，用作 ADFS AppliesTo。"""
+    found = []
+    candidates = [
+        ECM_BASE_URL + "/otdsws/login?metadata",
+        ECM_BASE_URL + "/otdsws/saml2/metadata",
+        ECM_BASE_URL + "/OTCS/cs.exe?func=saml2.metadata",
+        ECM_BASE_URL + "/OTCS/cs.exe?func=saml.spmetadata",
+    ]
+    for url in candidates:
+        try:
+            r = session.get(url, verify=False, timeout=15)
+            if r.status_code == 200 and "entityID" in r.text:
+                for m in re.findall(r'entityID="([^"]+)"', r.text):
+                    if m not in found:
+                        found.append(m)
+                        print(f"  发现 SAML entityID: {m}")
+        except Exception:
+            pass
+    return found
+
+
+def adfs_login(session, username, password):
+    """
+    ADFS WS-Trust usernamemixed：密码通常在此被接受（诊断显示 InvalidScope
+    而非 FailedAuthentication）。逐个 AppliesTo 候选尝试，拿到 SAML 后换 OTCS。
+    返回 OTCS ticket / "COOKIE" / None。
+    """
     adfs_user = username if "\\" in username else f"HENGRUI\\{username}"
-    adfs_wstrust_url = ("https://adfs.hengrui.com/adfs/services/trust/13"
-                        "/usernamemixed")
-    soap_envelope = f"""<?xml version="1.0" encoding="utf-8"?>
+    adfs_url = ("https://adfs.hengrui.com/adfs/services/trust/13/usernamemixed")
+
+    applies_to_list = _discover_saml_entityids(session) + [
+        ECM_BASE_URL + "/otdsws/login",
+        ECM_BASE_URL + "/otdsws",
+        ECM_BASE_URL + "/OTCS/cs.exe",
+        ECM_BASE_URL + "/OTCS/cs.exe/",
+        ECM_BASE_URL,
+    ]
+
+    for applies_to in applies_to_list:
+        soap = f"""<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
             xmlns:a="http://www.w3.org/2005/08/addressing"
             xmlns:u="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
   <s:Header>
     <a:Action s:mustUnderstand="1">http://docs.oasis-open.org/ws-sx/ws-trust/200512/RST/Issue</a:Action>
-    <a:To s:mustUnderstand="1">{adfs_wstrust_url}</a:To>
+    <a:To s:mustUnderstand="1">{adfs_url}</a:To>
     <o:Security s:mustUnderstand="1"
        xmlns:o="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
       <o:UsernameToken>
@@ -212,118 +245,138 @@ def ecm_authenticate(session, username, password):
   <s:Body>
     <trust:RequestSecurityToken xmlns:trust="http://docs.oasis-open.org/ws-sx/ws-trust/200512">
       <wsp:AppliesTo xmlns:wsp="http://schemas.xmlsoap.org/ws/2004/09/policy">
-        <a:EndpointReference>
-          <a:Address>{ECM_BASE_URL}</a:Address>
-        </a:EndpointReference>
+        <a:EndpointReference><a:Address>{applies_to}</a:Address></a:EndpointReference>
       </wsp:AppliesTo>
       <trust:RequestType>http://docs.oasis-open.org/ws-sx/ws-trust/200512/Issue</trust:RequestType>
       <trust:KeyType>http://docs.oasis-open.org/ws-sx/ws-trust/200512/Bearer</trust:KeyType>
     </trust:RequestSecurityToken>
   </s:Body>
 </s:Envelope>"""
-    try:
-        resp = session.post(
-            adfs_wstrust_url, data=soap_envelope.encode("utf-8"),
-            headers={"Content-Type": "application/soap+xml; charset=utf-8"},
-            verify=False, timeout=30,
-        )
-        if resp.status_code == 200 and "RequestedSecurityToken" in resp.text:
-            import re
-            match = re.search(
-                r"<trust:RequestedSecurityToken>(.*?)</trust:RequestedSecurityToken>",
-                resp.text, re.DOTALL,
+        print(f"  [ADFS WS-Trust] AppliesTo={applies_to} ...")
+        try:
+            resp = session.post(
+                adfs_url, data=soap.encode("utf-8"),
+                headers={"Content-Type": "application/soap+xml; charset=utf-8"},
+                verify=False, timeout=30,
             )
-            if match:
-                saml_token = match.group(1).strip()
-                print("  ADFS token 获取成功，换取 OTCS ticket ...")
-                otcs_resp = session.post(
-                    ECM_AUTH_URL, data={"SAMLToken": saml_token},
-                    verify=False, timeout=30,
-                )
-                if otcs_resp.status_code == 200:
-                    ticket = (otcs_resp.json() or {}).get("ticket") or ""
-                    if ticket:
-                        print("  ✔ ADFS → OTCS ticket 成功")
-                        return ticket
-                print(f"  ✘ SAML→OTCS 换票失败 HTTP {otcs_resp.status_code}: "
-                      f"{_short(otcs_resp.text)}")
-        else:
-            print(f"  ✘ ADFS WS-Trust HTTP {resp.status_code}: "
-                  f"{_short(resp.text)}")
-    except Exception as e:
-        print(f"  ✘ ADFS 请求异常: {e}")
+        except Exception as e:
+            print(f"  ✘ ADFS 请求异常: {e}")
+            continue
 
+        if "FailedAuthentication" in resp.text or "ID3242" in resp.text:
+            print("  ✘ ADFS 拒绝：用户名或密码错误。")
+            return None  # 密码错，换 AppliesTo 也没用
+        if resp.status_code == 200 and "RequestedSecurityToken" in resp.text:
+            m = re.search(
+                r"<trust:RequestedSecurityToken>(.*?)</trust:RequestedSecurityToken>",
+                resp.text, re.DOTALL)
+            if m:
+                saml = m.group(1).strip()
+                print("  ✔ 拿到 SAML token，尝试换 OTCS ...")
+                # 换法1：表单 SAMLToken
+                try:
+                    r = session.post(ECM_AUTH_URL, data={"SAMLToken": saml},
+                                     verify=False, timeout=30)
+                    if r.status_code == 200:
+                        t = (r.json() or {}).get("ticket") or ""
+                        if t:
+                            print("  ✔ ADFS → OTCS ticket 成功")
+                            return t
+                    print(f"  ✘ SAML→OTCS 换票 HTTP {r.status_code}: "
+                          f"{_short(r.text, 300)}")
+                except Exception as e:
+                    print(f"  ✘ 换票异常: {e}")
+                print("  （SAML 换 OTCS 失败，多需管理员配好 ACS；建议改用方式 A 票据）")
+                return None
+        if "InvalidScope" in resp.text or "ID3082" in resp.text:
+            print("  ✘ 该 AppliesTo 作用域无效，换下一个候选 ...")
+            continue
+        print(f"  ✘ ADFS 未知返回 HTTP {resp.status_code}: {_short(resp.text, 300)}")
+    return None
+
+
+def authenticate(session, username, password):
+    """按 B(OTDS) → C(OTCS表单/ADFS) 顺序尝试，返回 ticket 字符串或 'COOKIE'。"""
+    t = otds_login(session, username, password)
+    if t:
+        return t
+    t = otcs_form_login(session, username, password)
+    if t:
+        return t
+    t = adfs_login(session, username, password)
+    if t:
+        return t
     raise RuntimeError(
-        "所有认证方式均失败。请根据上面每种方式打印的服务器返回定位问题："
-        "常见原因是账号/密码错、该账号无 REST API 权限、或 ECM 未启用对应认证端点。"
+        "自动登录全部失败。本 ECM 多为 ADFS 联合登录，"
+        "请改用【方式 A：浏览器票据】——见脚本顶部说明，或运行 "
+        "python sharepoint_file_list.py --ticket <浏览器复制的OTCSTicket>"
     )
 
 
 # ============================================================================
-# ECM 客户端（持有 session + ticket，支持票据过期自动重认证）
+# ECM 客户端
 # ============================================================================
 
 class EcmClient:
-    def __init__(self, username, password):
+    def __init__(self, ticket=None, username=None, password=None):
+        self.session = requests.Session()
         self.username = username
         self.password = password
-        self.session = requests.Session()
-        self.ticket = ecm_authenticate(self.session, username, password)
+        if ticket:
+            # 方式 A：直接使用浏览器票据
+            self.ticket = ticket
+            print("  使用手动提供的 OTCSTicket（方式 A）。")
+        else:
+            # 方式 B/C：自动登录
+            self.ticket = authenticate(self.session, username, password)
 
     def _headers(self):
-        return {"OTCSTicket": self.ticket}
+        # cookie 模式下 self.ticket=="COOKIE"，靠 session cookie 认证，不发 header
+        if self.ticket and self.ticket != "COOKIE":
+            return {"OTCSTicket": self.ticket}
+        return {}
+
+    def _reauth(self):
+        if self.username and self.password:
+            print("  ! 重新认证 ...")
+            self.ticket = authenticate(self.session, self.username, self.password)
+            return True
+        print("  ! 手动票据已过期，请重新从浏览器复制 OTCSTicket 后再跑。")
+        return False
 
     def get(self, url, params=None, _retry=True):
-        """带票据的 GET；遇 401/403 先重认证再重试一次。"""
-        resp = self.session.get(
-            url, headers=self._headers(), params=params,
-            verify=False, timeout=60,
-        )
-        if resp.status_code in (401, 403) and _retry:
-            print(f"  ! {resp.status_code} 疑似票据过期/无权限，重新认证后重试 ...")
-            self.ticket = ecm_authenticate(self.session,
-                                           self.username, self.password)
+        resp = self.session.get(url, headers=self._headers(), params=params,
+                                verify=False, timeout=60)
+        if resp.status_code in (401, 403) and _retry and self._reauth():
             return self.get(url, params=params, _retry=False)
         return resp
 
     def node_info(self, node_id):
-        """取单个节点元数据（诊断用）。返回 properties dict 或 None。"""
         resp = self.get(f"{ECM_API_BASE}/nodes/{node_id}")
         if resp.status_code != 200:
             print(f"    ✘ 读取节点 {node_id} 失败 HTTP {resp.status_code}: "
                   f"{_short(resp.text, 400)}")
             return None
-        data = resp.json() or {}
-        # v2: {"results": {"data": {"properties": {...}}}}  (单节点)
-        results = data.get("results") or {}
+        results = (resp.json() or {}).get("results") or {}
         if isinstance(results, list):
             results = results[0] if results else {}
         return results.get("data", {}).get("properties", {})
 
 
 def build_ecm_url(node_id):
-    """构造 ECM 节点浏览 URL（Smart View 预览）"""
     return f"{ECM_NODE_URL}/{node_id}"
 
 
 def collect_files_from_ecm(client, node_id, base_path=""):
-    """
-    递归遍历 ECM 节点下所有文件，返回 [(name, url, sub_dir), ...]
-    base_path 用于计算 sub_dir（根目录文件 sub_dir=""）。
-    """
     out = []
     page = 1
     while True:
-        resp = client.get(
-            f"{ECM_API_BASE}/nodes/{node_id}/nodes",
-            params={"limit": PAGE_SIZE, "page": page},
-        )
+        resp = client.get(f"{ECM_API_BASE}/nodes/{node_id}/nodes",
+                          params={"limit": PAGE_SIZE, "page": page})
         if resp.status_code != 200:
-            # 不再静默：打印失败原因（节点ID/权限/票据）
             raise RuntimeError(
                 f"列出节点 {node_id} 子项失败 HTTP {resp.status_code}: "
-                f"{_short(resp.text, 400)}"
-            )
+                f"{_short(resp.text, 400)}")
         data = resp.json() or {}
         results = data.get("results") or []
         if not results:
@@ -335,31 +388,24 @@ def collect_files_from_ecm(client, node_id, base_path=""):
             child_id = props.get("id")
             if not name or child_id is None:
                 continue
-
-            # 关键修复：优先用 container 布尔判断是否为文件夹/容器；
-            # 回退到 type==0（Folder）。
             is_container = props.get("container")
             if is_container is None:
                 is_container = (props.get("type") == 0)
-
             if is_container:
-                sub_path = f"{base_path}/{name}" if base_path else name
-                out.extend(collect_files_from_ecm(client, child_id, sub_path))
+                sub = f"{base_path}/{name}" if base_path else name
+                out.extend(collect_files_from_ecm(client, child_id, sub))
             else:
                 out.append((name, build_ecm_url(child_id), base_path))
 
-        # 分页：优先用服务器返回的 page_total
         paging = data.get("collection", {}).get("paging", {})
         page_total = paging.get("page_total")
         if page_total is not None:
             if page >= page_total:
                 break
         else:
-            total = paging.get("total_count", 0)
-            if page * PAGE_SIZE >= total:
+            if page * PAGE_SIZE >= paging.get("total_count", 0):
                 break
         page += 1
-
     return out
 
 
@@ -384,7 +430,7 @@ def write_xlsx(output_path, data_by_sheet):
 
 
 # ============================================================================
-# 诊断模式
+# 诊断
 # ============================================================================
 
 def run_diagnose(client):
@@ -395,16 +441,14 @@ def run_diagnose(client):
     for sheet_name, node_id, label in TARGETS:
         print(f"\n[{sheet_name}] {label}  node_id={node_id}")
         if node_id in seen:
-            print(f"  ⚠ 警告：与 [{seen[node_id]}] 使用了相同的 node_id，"
-                  f"两个 tab 会得到完全相同的内容（很可能是配置错误）")
+            print(f"  ⚠ 与 [{seen[node_id]}] 用了相同 node_id，两个 tab 内容会一样"
+                  f"（很可能是配置错误）")
         seen[node_id] = sheet_name
-
         props = client.node_info(node_id)
         if props is None:
             continue
         print(f"  节点名: {props.get('name')}  type={props.get('type')} "
               f"container={props.get('container')}")
-        # 探测第一页子项数量
         resp = client.get(f"{ECM_API_BASE}/nodes/{node_id}/nodes",
                           params={"limit": 5, "page": 1})
         if resp.status_code != 200:
@@ -413,38 +457,48 @@ def run_diagnose(client):
             continue
         data = resp.json() or {}
         paging = data.get("collection", {}).get("paging", {})
-        print(f"  子项总数(total_count)={paging.get('total_count')}  "
-              f"前几项：")
+        print(f"  子项总数={paging.get('total_count')}  前几项：")
         for item in (data.get("results") or [])[:5]:
             p = item.get("data", {}).get("properties", {})
             print(f"    - {p.get('name')}  (id={p.get('id')} "
                   f"type={p.get('type')} container={p.get('container')})")
-    print("\n诊断结束。若上面能看到正确的节点名和子项，说明认证/权限/节点 ID 均正常，")
-    print("可去掉 --diagnose 正式运行。若某项报错，请按状态码定位（401票据/403权限/404节点）。")
+    print("\n诊断结束。若能看到正确节点名与子项，说明认证/权限/节点 ID 均正常。")
 
 
 # ============================================================================
 # 主流程
 # ============================================================================
 
+def _get_arg_ticket():
+    if "--ticket" in sys.argv:
+        i = sys.argv.index("--ticket")
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return os.environ.get("ECM_TICKET")
+
+
 def main():
     diagnose = "--diagnose" in sys.argv
+    ticket = _get_arg_ticket()
 
     print("=" * 60)
-    print("ECM 文档目录爬取工具 — SPAhub 数据源刷新  (v5)")
+    print("ECM 文档目录爬取工具 — SPAhub 数据源刷新  (v6)")
     print("=" * 60)
 
-    username = os.environ.get("ECM_USER") or input(
-        "请输入 ECM 用户名（如 DOMAIN\\username）: ")
-    password = os.environ.get("ECM_PASS") or getpass.getpass("请输入密码: ")
-
-    print("\n正在连接 ECM 并认证...")
-    try:
-        client = EcmClient(username, password)
-        print("认证成功，已获取 OTCSTicket")
-    except Exception as e:
-        print(f"\n认证失败: {e}")
-        sys.exit(1)
+    if ticket:
+        print("检测到 OTCSTicket（方式 A），跳过账号密码登录。")
+        client = EcmClient(ticket=ticket)
+    else:
+        username = os.environ.get("ECM_USER") or input(
+            "请输入 ECM 用户名（如 liup71）: ")
+        password = os.environ.get("ECM_PASS") or getpass.getpass("请输入密码: ")
+        print("\n正在连接 ECM 并认证...")
+        try:
+            client = EcmClient(username=username, password=password)
+            print("认证成功。")
+        except Exception as e:
+            print(f"\n认证失败: {e}")
+            sys.exit(1)
 
     if diagnose:
         run_diagnose(client)
@@ -469,8 +523,8 @@ def main():
             data_by_sheet[sheet_name] = []
 
     if total == 0:
-        print("\n⚠ 一个文件都没爬到，未覆盖旧的 xlsx（避免清空可用数据）。")
-        print("  请先用 python sharepoint_file_list.py --diagnose 排查。")
+        print("\n⚠ 一个文件都没爬到，未覆盖旧 xlsx（避免清空可用数据）。")
+        print("  请先 python sharepoint_file_list.py --diagnose 排查。")
         sys.exit(2)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
